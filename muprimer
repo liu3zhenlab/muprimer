@@ -1,0 +1,230 @@
+#!/usr/bin/perl -w
+#################################################################################
+# Sanzhen Liu
+# 12/20/2021
+# to design primers for Mu insertions
+# version 0.1
+#################################################################################
+
+use strict;
+use warnings;
+use Getopt::Std;
+use IO::Pipe;
+use File::Temp;
+use FindBin;
+
+my $mu_tir = "AGAGAAGCCAACGCCAWCGCCTCYATTTCGTC";
+my $primer3cfg="/homes/liu3zhen/software/primer3/primer3-2.3.7/src/primer3_config";
+my $prefix = "gsp";
+my $ext5 = 1000;
+my $ext3 = 500;
+
+### options:
+my %opts = (i=>"", g=> "", m=>"", a=>0, c=>$primer3cfg, p=>$prefix, n=>0, h=>0);	
+getopts('i:g:m:a:5:3:p:c:nh', \%opts);
+die(qq/
+Usage: $0 -i <fasta> -m <mu_info> [options]
+Options:
+    -i <file> reference fasta file (required)
+    -g <file> gtf file of genes (required)
+    -m <file> mu insertion information; aflat file with tab-separated columns (required)
+              example (mu1014353	UniformMu_R9	B73v4	3	160591491	160591499	Zmxx)
+    -a <num>  a coordinate to be adjusted (0)
+    -5 <num>  bp extension on 5' (1000)
+    -3 <num>  bp extension on 3' (500)
+    -p <str>  prefix for outputs
+    -c <str>  primer3 config path ($opts{c})
+    -n        whether or not print out failed designs. Not to print failed if it is specified
+\n/) if ($opts{h} || $opts{i} eq "" || $opts{g} eq "" || $opts{m} eq "");
+
+### import sequence data from the fasta file:
+my $print_all = 1;
+if ($opts{n}) { $print_all = 0; }
+if (defined $opts{c}) { $primer3cfg = $opts{c}; }
+
+my ($ref, $gtf, $mu);
+if (defined $opts{i}) { $ref = $opts{i}; }
+if (defined $opts{g}) { $gtf = $opts{g}; }
+if (defined $opts{m}) { $mu = $opts{m}; } 
+if (defined $opts{5}) { $ext5 = $opts{5}; }
+if (defined $opts{3}) { $ext3 = $opts{3}; }
+if (defined $opts{p}) { $prefix = $opts{p}; }
+
+# script path:
+my $scriptPath = $FindBin::Bin;
+my $utilsPath = $scriptPath."/utils/";
+
+#######################################################################
+### import Mu insertion data
+#######################################################################
+my %mu_info;
+open(MU, $mu) || die;
+while (<MU>) {
+	chomp;
+	#mu1014353    UniformMu_R9    B73v4   3   160591491   160591499	Zm00001d042315
+	my ($mu, $mudb, $ref, $chr, $start, $end, $gene) = split(/\t/, $_); 
+	if (exists $mu_info{$gene}{$mu}) {
+		print STDERR "Warning: Duplicated Mu insertions in $opts{m}. Only the last one is used\n";
+	} else {
+		$mu_info{$gene}{$mu} = $_;
+	}
+}
+close MU;
+
+#######################################################################
+# run geneseq
+#######################################################################
+foreach my $egene (keys %mu_info) {
+	`$scriptPath/geneseq --fas $ref --gtf $gtf --gene $egene --prefix $egene --ext5 $ext5 --ext3 $ext3`;
+}
+
+#######################################################################
+# fasta
+#######################################################################
+
+my %seqhash;
+foreach my $egene (keys %mu_info) {
+	my $fasta = $egene."/".$egene.".1.".$egene.".fasta";
+	my ($name, $seq);
+	open(IN, $fasta) || die;
+	while (<IN>) {
+		chomp;
+		if (/^>(.+)/) {
+			if (defined $name) {
+				$seqhash{$name} = $seq;
+			}
+			$name = $1;
+			$seq = '';
+		} else {
+			$seq .= $_;
+		}
+	}
+	$seqhash{$name} = $seq;
+	close IN;
+}
+
+### output
+my $primer_outfile = $prefix.".primers";
+open(PRIMER, ">", $primer_outfile);
+print PRIMER "mu\tref\tchr\tmu_start\tmu_end\tgene\tmu_gStart\tmu_gEnd\tforward_gPos\tforward\treverse_gPos\treverse\tPCR_Size\tsourceSeq\n";
+
+### search and output
+for my $egene (sort {$a cmp $b} keys %seqhash) {
+	# gene BED file
+	my $bed = $egene."/".$egene.".3.".$egene.".original.bed";
+	my $adjust_ori;
+	my $adjust_pos;
+	open(BED, $bed) || die;
+	while (<BED>) {
+		my @line = split(/\t/, $_);
+		if ($line[5] eq "-") {
+			$adjust_ori = "-";
+			$adjust_pos = $line[2];
+		} else {
+			$adjust_ori = "+";
+			$adjust_pos = $line[1] + 1;
+		}
+	}
+	close BED;
+	
+	# design primers:
+	my $eachseq = $seqhash{$egene};
+	if (exists $mu_info{$egene}) {
+		my %mu_data = %{$mu_info{$egene}};
+		foreach my $each_mu (keys %mu_data) {
+			my ($mu, $mudb, $ref, $chr, $start, $end, $gene) = split(/\t/, $mu_data{$each_mu});
+			my ($adjust_start, $adjust_end); 
+			
+			if ($adjust_ori eq "+") {
+				$adjust_start = $start - $adjust_pos + 1;
+				$adjust_end = $end - $adjust_pos + 1;
+			} else {
+				$adjust_start = $adjust_pos -  $end + 1;
+				$adjust_end = $adjust_pos - $start + 1;
+			}
+			my $primers_design_info = &primer3_input_target($egene, $eachseq, $adjust_start);
+			#print "$primers_design_info\n";
+			my $in_tmp = File::Temp->new(SUFFIX => 'primer3in');
+			print $in_tmp "$primers_design_info\n";
+			my $out_tmp = File::Temp->new(SUFFIX => 'primer3out');
+			system(sprintf("%s < %s > %s", "primer3_core", $in_tmp, $out_tmp));
+			my $primers_out = &primer3parse($out_tmp);
+			my ($forward_pos, $forward_primer, $reverse_pos, $reverse_primer, $product_size) = @$primers_out;
+			if ($forward_primer ne "NA") {
+				print PRIMER "$mu\t$ref\t$chr\t$start\t$end\t$gene\t$adjust_start\t$adjust_end\t$forward_pos\t$forward_primer\t$reverse_pos\t$reverse_primer\t$product_size\t$eachseq\n";
+			} elsif ($print_all) {
+				print PRIMER "$mu\t$ref\t$chr\t$start\t$end\t$gene\t$adjust_start\t$adjust_end\t$forward_pos\t$forward_primer\t$reverse_pos\t$reverse_primer\t$product_size\t$eachseq\n";
+			}
+			# cleanup
+			$in_tmp->unlink_on_destroy( 1 );
+			$out_tmp->unlink_on_destroy( 1 );
+		}
+	}
+}
+
+##################################################
+### module: reverse complementary
+##################################################
+sub revcom {
+	my $inseq = shift @_; 
+	my $revcom = reverse($inseq);
+	$revcom =~ tr/AGCTagct/TCGAtcga/;
+	return $revcom;
+}
+
+##################################################
+### left on polymorphic sites:
+##################################################
+sub primer3_input_target {
+	my ($in_seqname, $in_seq, $mu_site) = @_;
+	my $print_str = 
+"PRIMER_PRODUCT_SIZE_RANGE=100-800
+PRIMER_NUM_RETURN=1
+PRIMER_OPT_TM=60
+PRIMER_MIN_TM=55
+PRIMER_MAX_TM=65
+PRIMER_MAX_DIFF_TM=5.0
+PRIMER_MAX_POLY_X=3
+PRIMER_EXPLAIN_FLAG=1
+SEQUENCE_ID=$in_seqname
+SEQUENCE_TEMPLATE=$in_seq
+PRIMER_TASK=generic
+SEQUENCE_TARGET=$mu_site,9
+PRIMER_OPT_SIZE=19
+PRIMER_MIN_SIZE=18
+PRIMER_MAX_SIZE=22
+PRIMER_MAX_NS_ACCEPTED=1
+PRIMER_THERMODYNAMIC_PARAMETERS_PATH=$primer3cfg/
+=";
+
+	return $print_str;
+}
+
+###################################################
+### parsing single design output
+###################################################
+sub primer3parse {
+### only one design (one primer set) was input
+	my $primer3_out = shift @_;
+	open (IN, $primer3_out) || die ("pimer3 output error\n");
+	my $left = "NA";
+	my $right = "NA";
+	my $size = "NA";
+	my $left_pos = "NA";
+	my $right_pos = "NA";
+	while (<IN>) {
+		my @line = split ("\n",$_);
+		foreach (@line){
+			$left = $1 if /PRIMER_LEFT_0_SEQUENCE=(.*)/;
+			$right = $1 if /PRIMER_RIGHT_0_SEQUENCE=(.*)/;
+			$size = $1 if /PRIMER_PAIR_0_PRODUCT_SIZE=(\d+)/;
+			$left_pos = $1 if /PRIMER_LEFT_0=(\d+)\,/;
+			$right_pos = $1 if /PRIMER_RIGHT_0=(\d+)\,/;
+		}
+	}
+	### output
+	my @out = ($left_pos, $left, $right_pos, $right, $size);
+	return \@out;
+	close IN;
+}
+
